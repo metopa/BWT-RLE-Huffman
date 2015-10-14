@@ -12,10 +12,10 @@ using namespace std;
 
 int main() {
 	const char * iniFile = "settings.txt";
-	string input1( "D:\\bwt\\big.cpp" );
-	string input2( "D:\\bwt\\small.flac" );
-	string encoded( "D:\\bwt\\encoded.bin" );
-	string decoded( "D:\\bwt\\decoded.cpp" );
+	string input1( "D:\\Sources\\C++\\BWT-RLE-Huffman\\examples\\code.data" );
+	string input2( "D:\\Sources\\C++\\BWT-RLE-Huffman\\examples\\audio.data" );
+	string encoded( "D:\\Sources\\C++\\BWT-RLE-Huffman\\examples\\encoded.brh" );
+	string decoded( "D:\\Sources\\C++\\BWT-RLE-Huffman\\examples\\decoded.data" );
 	/*ifstream settings( iniFile );
 	if ( settings.is_open() ) {
 		getline( settings, input );
