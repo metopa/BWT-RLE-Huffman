@@ -3,19 +3,19 @@
 //
 
 #include "CCoder.h"
+
+#include <cstring>
+
 #include "bwt/CBwtEncoderBuf.h"
+#include "bwt/CBwtDecoder.h"
+#include "bwt/CBwtDecoderBuf.h"
 #include "rle/CRleEncoderBuf.h"
 #include "rle/CRleDecoder.h"
 #include "rle/CRleDecoderBuf.h"
-#include "bwt/CBwtDecoder.h"
-#include "bwt/CBwtDecoderBuf.h"
-#include "CLogger.h"
-#include "streams/CContainerBuf.h"
 #include "huffman/CHuffmanEncoder.h"
 
-using namespace std;
 
-//TODO make args buffers
+using namespace std;
 
 /**
  * Output structure
@@ -49,16 +49,60 @@ void CCoder::encode( ifstream& in, ostream& out, size_t blockSize ) {
 	CFISFromStream encodeIn( in );
 	CFOSFromStream encodeOut( out );
 
-	encodeExternal( encodeIn, encodeOut, "D:\\bwt\\temp.bin", blockSize );
+	if ( fileSize <= maxInmemorySize )
+		encodeInMemory( encodeIn, encodeOut, blockSize );
+	else
+		encodeExternal( encodeIn, encodeOut, blockSize );
 
 	logger.printStats( false );
 }
 
 void CCoder::encodeInMemory( CFastIStream& in, CFastOStream& out, size_t blockSize ) {
+	CFOSInMemory temp( logger.getOriginalFileSize() / 3 * 2 );
 
+	in.attachLogger( &logger );
+	temp.attachLogger( &logger );
+
+	CBwtEncoder bwt( in, blockSize );
+	CBwtEncoderBuf bwtBuf( bwt );
+	CFISFromBuffer rleIn( bwtBuf );
+
+	CRleEncoder rle( rleIn );
+	CRleEncoderBuf rleBuf( rle, 1024 * 1024 );
+
+	CFISFromBuffer rleStream( rleBuf );
+	CFastOStream& hack = temp;
+	hack.put( rleStream );
+
+	CContainerBuf headerBuf( bwtBuf.getHeader() );
+	CFISFromBuffer headerStream( headerBuf );
+	hack.put( headerStream );
+
+	in.detachLogger();
+	temp.detachLogger();
+
+	logger.setFileSize( temp.getBuffer().size() );
+
+	logger.startNewActivity( CLogger::HUFFMAN );
+
+	CContainerBuf huffInBuf( temp.getBuffer() ),
+				huffInBuf2( temp.getBuffer() );
+	CFISFromBuffer huffIn( huffInBuf ),
+			  	   huffIn2( huffInBuf2 );
+
+	CHuffmanEncoder huffman( huffIn, out );
+	huffman.generateTable( huffIn2 );
+
+	huffIn.attachLogger( &logger );
+	out.attachLogger( &logger );
+	huffman.encode();
+	huffIn.detachLogger();
+	out.detachLogger();
+
+	logger.finishActivity();
 }
 
-void CCoder::encodeExternal( CFastIStream& in, CFastOStream& out, const char * tempFile, size_t blockSize ) {
+void CCoder::encodeExternal( CFastIStream& in, CFastOStream& out, size_t blockSize, const char * tempFile ) {
 	fstream temp;
 	temp.open( tempFile, ios::out | ios::binary | ios::trunc );
 	if ( !temp.is_open() )
@@ -135,11 +179,32 @@ bool CCoder::decode( const char * in, const char * out ) {
 	logger.setOriginalFileSize( (size_t) inFile.tellg() );
 	inFile.seekg( 0, inFile.beg );
 
-	bool rc = decodeExternal( inStream, outStream, "WlORUnZC.temp" );
+	bool rc;
+
+	if ( logger.getOriginalFileSize() <= maxInmemorySize )
+		rc = decodeInMemory( inStream, outStream );
+	else
+		rc = decodeExternal( inStream, outStream );
+
 	logger.printStats( true );
 	return rc;
 }
 
+bool CCoder::decodeInMemory( CFastIStream& in, CFastOStream& out ) {
+	CFOSInMemory temp( logger.getOriginalFileSize() / 2 * 3 );
+	in.attachLogger( &logger );
+	temp.attachLogger( &logger );
+
+	CHuffmanDecoder huffman( in, temp );
+	logger.startNewActivity( CLogger::HUFFMAN );
+	if ( !huffman.decode() )
+		throw exceptions::fail();
+	in.detachLogger();
+	temp.detachLogger();
+	logger.finishActivity();
+
+	return decodeRLE( temp.getBuffer(), out );
+}
 
 bool CCoder::decodeExternal( CFastIStream& in, CFastOStream& out, const char * tempFile ) {
 	fstream temp;
@@ -147,18 +212,16 @@ bool CCoder::decodeExternal( CFastIStream& in, CFastOStream& out, const char * t
 	if ( !temp.is_open() )
 		throw exceptions::fail();
 
-	{
-		CFOSFromStream tempOut( temp );
-		in.attachLogger( &logger );
-		tempOut.attachLogger( &logger );
-		CHuffmanDecoder huffman( in, tempOut );
-		logger.startNewActivity( CLogger::HUFFMAN );
-		if ( !huffman.decode() )
-			throw exceptions::fail();
-		in.detachLogger();
-		tempOut.detachLogger();
-		logger.finishActivity();
-	}
+	CFOSFromStream tempOut( temp );
+	in.attachLogger( &logger );
+	tempOut.attachLogger( &logger );
+	CHuffmanDecoder huffman( in, tempOut );
+	logger.startNewActivity( CLogger::HUFFMAN );
+	if ( !huffman.decode() )
+		throw exceptions::fail();
+	in.detachLogger();
+	tempOut.detachLogger();
+	logger.finishActivity();
 
 	temp.close();
 	temp.open( tempFile, ios::in | ios::binary );
@@ -173,6 +236,38 @@ bool CCoder::decodeExternal( CFastIStream& in, CFastOStream& out, const char * t
 }
 
 
+bool CCoder::decodeRLE( const string& in, CFastOStream& out ) {
+	struct TControlData{
+		uint32_t blockSize = 0;
+		uint32_t lastBlockSize = 0;
+		uint32_t blockCount = 0;
+	} cData;
+
+
+	logger.setFileSize( in.size() );
+	if ( in.size() < sizeof(TControlData) )
+		throw exceptions::fail();
+
+	memcpy( (void*)&cData, &in[in.size()-sizeof(TControlData)], sizeof(TControlData) );
+
+	size_t blockPos = cData.blockCount * 4 + 12;
+	if ( in.size() < blockPos )
+		throw exceptions::fail();
+	blockPos = in.size() - blockPos;
+
+	vector<uint32_t> header;
+	header.resize( cData.blockCount, 0 );
+	memcpy( (void*)&header.front(), &in[blockPos], cData.blockCount * 4 );
+
+	logger.updateInput( cData.blockCount * 4 + 12 );
+
+	CContainerBuf inBuf( in );
+	CFISFromBuffer inStream( inBuf );
+
+	return decodeRLE( inStream, out, header, cData.blockSize,
+					  cData.lastBlockSize, cData.blockCount );
+}
+
 bool CCoder::decodeRLE( fstream& in, CFastOStream& out ) {
 	uint32_t blockSize = 0;
 	uint32_t lastBlockSize = 0;
@@ -183,10 +278,12 @@ bool CCoder::decodeRLE( fstream& in, CFastOStream& out ) {
 	in.read( (char *) &blockSize, 4 );
 	in.read( (char *) &lastBlockSize, 4 );
 	in.read( (char *) &blockCount, 4 );
-	in.seekg( -12 - (int) blockCount * 4, in.end );
+
+	in.seekg( -12 - (int64_t)blockCount * 4, in.end );
 
 	vector<uint32_t> header;
 	header.resize( blockCount, 0 );
+
 	in.read( (char *) &header.front(), blockCount * 4 );
 
 	if ( in.fail() )
